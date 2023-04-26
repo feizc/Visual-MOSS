@@ -792,8 +792,36 @@ class VisualMossModel(MossPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+        elif input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length 
+        
+        if inputs_embeds is None: 
+            inputs_embeds = self.transformer.wte(input_ids)
+
+        if images is not None: 
+            _, image_forward_outs = self.vision_tower.get_image_features(pixel_values=images)
+            select_hidden_state = image_forward_outs.last_hidden_state 
+            image_features = select_hidden_state[:, 1:] 
+            image_features = self.mm_projector(image_features) 
+
+        # adjust input embedding and attention mask 
+        inputs_embeds = torch.cat((image_features, inputs_embeds), dim=1) 
+        attention_mask = torch.cat((torch.ones((batch_size, image_features.size(1))), attention_mask), dim=1)
+
         transformer_outputs = self.transformer(
-            input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -814,10 +842,10 @@ class VisualMossModel(MossPreTrainedModel):
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
+            # Shift so that tokens < n predict n, ignore the image token 
+            shift_logits = lm_logits[..., image_features.size(1):-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
+            # Flatten the tokens 
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 

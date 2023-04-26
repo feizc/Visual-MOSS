@@ -206,6 +206,8 @@ class ViusalMossConfig(PretrainedConfig):
         bos_token_id=106028,
         eos_token_id=106068,
         tie_word_embeddings=False,
+        mm_vision_tower='./cn_clip', 
+        mm_embd=1024,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -223,6 +225,9 @@ class ViusalMossConfig(PretrainedConfig):
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
         self.use_cache = use_cache
+
+        self.mm_vision_tower = mm_vision_tower
+        self.mm_embd = mm_embd
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
