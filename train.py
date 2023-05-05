@@ -7,7 +7,7 @@ import transformers
 import torch.utils.tensorboard as tensorboard 
 from transformers import ChineseCLIPProcessor
 
-from utils import ImageTextDataset 
+from utils import FastImageTextDataset, UrlTextDataset 
 
 
 DEFAULT_IMAGE_TOKEN = "<Image>" 
@@ -46,11 +46,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
     max_length = 256
     learning_rate = 5e-6
-    data_path = 'data.json'
-    train_batch_size = 2
+    data_path = 'train.pkl'
+    train_batch_size = 1
     gradient_accumulation_steps = 8
-    epochs = 10
+    epochs = 5
     tensorboard_path = 'log'
+    url_data = False
 
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -66,7 +67,8 @@ def main():
     config = MossConfig.from_pretrained(moss_path) 
     config.mm_vision_tower = clip_model_path
     config.mm_embd = 1024
-
+    
+    print('load visual moss')
     model = VisualMossModel(config) 
     model.load_state_dict(torch.load('out.pt'))
     model = model.to(device) 
@@ -85,7 +87,8 @@ def main():
         model_max_length=max_length, 
         padding_side="right",
         use_fast=False,
-    ) 
+    )
+    print('vocab', len(tokenizer))
 
     if tokenizer.pad_token is None: 
         smart_tokenizer_and_embedding_resize(
@@ -93,11 +96,11 @@ def main():
             tokenizer=tokenizer,
             model=model,
         ) 
-
+    print('vocab+pad', len(tokenizer))
     num_new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN], special_tokens=True)
     model.transformer.resize_token_embeddings(len(tokenizer)) 
     image_token_id = tokenizer.convert_tokens_to_ids([DEFAULT_IMAGE_TOKEN])
-    print(tokenizer.pad_token, image_token_id)
+    print(tokenizer.pad_token, image_token_id[0], len(tokenizer))
 
     if num_new_tokens > 0: 
         input_embeddings = model.get_input_embeddings().weight.data
@@ -118,13 +121,20 @@ def main():
     )
 
     # Dataset and DataLoaders creation 
-    train_dataset = ImageTextDataset(data_path=data_path, tokenizer=tokenizer, process=process) 
+    print('dataset prepare')
+    if url_data == True:
+        train_dataset = UrlTextDataset(data_path=data_path, tokenizer=tokenizer, process=process)
+    else:
+        train_dataset = FastImageTextDataset(data_path=data_path, tokenizer=tokenizer, process=process) 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, 
         batch_size=train_batch_size,
         shuffle=True,
     )
-
+    
+    model.transformer.eval() 
+    model.lm_head.eval() 
+    model.mm_projector.train()
     for epoch in range(epochs): 
         loss_cum = 0
         iteration = 0
@@ -135,7 +145,8 @@ def main():
                 iteration += 1 
                 image, input_ids, attention_mask = batch 
                 image, input_ids, attention_mask = image.to(device), input_ids.to(device), attention_mask.to(device) 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, images=image, labels=input_ids) 
+                #with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, image_features=image, labels=input_ids) 
                 loss = outputs.loss 
 
                 loss = loss / gradient_accumulation_steps 
@@ -152,11 +163,13 @@ def main():
                 if step % 10 == 0:
                     writer.add_scalar("train/loss", loss.item(), log_step)
 
-        print('save model') 
-        torch.save(model.state_dict(), os.path.join(save_path, 'ckpt.pt')) 
-        tokenizer.save_pretrained(save_path)
-        config.save_pretrained(save_path)
-
+                if iteration % 20000 == 0:
+                    torch.cuda.empty_cache() 
+                    print('save model') 
+                    torch.save(model, os.path.join(save_path, 'ckpt.pt')) 
+                    tokenizer.save_pretrained(save_path)
+                    config.save_pretrained(save_path)
+        
 
 if __name__ == "__main__":
     main()

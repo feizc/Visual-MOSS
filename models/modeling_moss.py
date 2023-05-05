@@ -713,21 +713,50 @@ class MossForCausalLM(MossPreTrainedModel):
 
 from transformers import ChineseCLIPVisionModel, ChineseCLIPProcessor, ChineseCLIPModel  
 
+class MLP(nn.Module):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+    def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.Tanh):
+        super(MLP, self).__init__()
+        layers = []
+        for i in range(len(sizes) - 1):
+            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=bias))
+            if i < len(sizes) - 2:
+                layers.append(act())
+        self.model = nn.Sequential(*layers)
+
+
+
 class VisualMossModel(MossPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.causal_mask"]
 
-    def __init__(self, config):
+    def __init__(self, config, vision_clip=False):
         super().__init__(config)
         self.transformer = MossModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-
+        
         # Initialize weights and apply final processing
         self.post_init()
 
         # vision projection 
-        self.vision_tower = ChineseCLIPModel.from_pretrained(config.mm_vision_tower)
-        self.mm_projector = nn.Linear(config.mm_embd, config.n_embd)
+        self.vision_clip = vision_clip 
+        self.q_former = 10 
+        self.vision_emb = 768 
+        self.n_embd = config.n_embd
+        if vision_clip == True:
+            self.vision_tower = ChineseCLIPModel.from_pretrained(config.mm_vision_tower)
+        
+        # self.mm_projector = nn.Linear(self.vision_emb, config.n_embd)
+        self.mm_projector = MLP((self.vision_emb, (self.vision_emb * self.q_former) // 2,
+                                     self.q_former * config.n_embd))
+    
+    def get_input_embeddings(self):
+        return self.transformer.wte
 
+    def set_input_embeddings(self, value):
+        self.transformer.wte = value
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -752,14 +781,16 @@ class VisualMossModel(MossPreTrainedModel):
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
+        print(input_ids.size(), attention_mask.size())
 
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "use_cache": kwargs.get("use_cache"),
-            "position_ids": position_ids,
+            #"position_ids": position_ids,
             "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
+            #"token_type_ids": token_type_ids,
+            "image_features": kwargs.get("image_features", None),
         }
 
     @add_start_docstrings_to_model_forward(MOSS_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
@@ -781,6 +812,7 @@ class VisualMossModel(MossPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        image_features: Optional[torch.FloatTensor] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -811,15 +843,17 @@ class VisualMossModel(MossPreTrainedModel):
         if inputs_embeds is None: 
             inputs_embeds = self.transformer.wte(input_ids)
 
-        if images is not None: 
+        if images is not None and self.vision_clip: 
             _, image_forward_outs = self.vision_tower.get_image_features(pixel_values=images)
             select_hidden_state = image_forward_outs.last_hidden_state 
             image_features = select_hidden_state[:, 1:] 
             image_features = self.mm_projector(image_features) 
+        else:
+            image_features = self.mm_projector(image_features).view(-1, self.q_former, self.n_embd)
 
         # adjust input embedding and attention mask 
         inputs_embeds = torch.cat((image_features, inputs_embeds), dim=1) 
-        attention_mask = torch.cat((torch.ones((batch_size, image_features.size(1))), attention_mask), dim=1)
+        attention_mask = torch.cat((torch.ones((batch_size, image_features.size(1))).to(attention_mask.device), attention_mask), dim=1)
 
         transformer_outputs = self.transformer(
             past_key_values=past_key_values,
@@ -846,7 +880,7 @@ class VisualMossModel(MossPreTrainedModel):
             shift_logits = lm_logits[..., image_features.size(1):-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens 
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss(ignore_index=106073)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
             loss = loss.to(hidden_states.dtype)
