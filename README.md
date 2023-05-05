@@ -7,6 +7,6 @@ Thanks for the open source of [MOSS](https://github.com/OpenLMLab/MOSS) and its 
 - [X] model code optimization 
 - [X] training / infer script 
 - [X] demo script for gradio 
-- [] ckpts on huggingface 
+- [ ] ckpts on huggingface 
 
 
